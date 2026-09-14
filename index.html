@@ -24,7 +24,7 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#111;font-f
 <div id="err"></div>
 <div id="joystick"><div id="stick"></div></div>
 <div id="look"></div>
-<div id="help">ПК: WASD + мышь • ESC — отпустить мышь</div>
+<div id="help">ПК: WASD • зажми ЛКМ и двигай мышь</div>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
 <script>
@@ -64,7 +64,7 @@ scene.background=new THREE.Color(0x15110b);
 scene.fog=new THREE.Fog(0x15110b,28,95);
 
 const camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,.05,120);
-camera.position.set(0,1.65,0);
+camera.position.set(CELL/2,1.65,CELL/2);
 
 const renderer=new THREE.WebGLRenderer({
   antialias:false,
@@ -258,10 +258,27 @@ function blocked(px,pz){
   return !isOpen(gx,gz);
 }
 function movePlayer(dx,dz){
-  const r=.45;
-  const nx=camera.position.x+dx, nz=camera.position.z+dz;
-  if(!blocked(nx+r,nz)&&!blocked(nx-r,nz)) camera.position.x=nx;
-  if(!blocked(camera.position.x,nz+r)&&!blocked(camera.position.x,nz-r)) camera.position.z=nz;
+  const r=.38;
+
+  // Проверяем отдельно X и Z, поэтому игрок не застревает
+  // из-за одной стены при движении по диагонали.
+  const nx=camera.position.x+dx;
+  const nz=camera.position.z+dz;
+
+  if(!blocked(nx+r,camera.position.z) &&
+     !blocked(nx-r,camera.position.z)){
+    camera.position.x=nx;
+  }
+
+  if(!blocked(camera.position.x,nz+r) &&
+     !blocked(camera.position.x,nz-r)){
+    camera.position.z=nz;
+  }
+
+  // Не позволяем выйти за границу карты.
+  const limit=(half*CELL)-.6;
+  camera.position.x=Math.max(-.1,Math.min(limit,camera.position.x));
+  camera.position.z=Math.max(-.1,Math.min(limit,camera.position.z));
 }
 
 // ---------------- MONSTER ----------------
@@ -310,38 +327,59 @@ function updateMonster(dt){
 }
 
 // ---------------- INPUT ----------------
-window.addEventListener("keydown",e=>{keys[e.key.toLowerCase()]=true; startAudio();});
-window.addEventListener("keyup",e=>{keys[e.key.toLowerCase()]=false;});
-
-renderer.domElement.addEventListener("click",()=>{
-  if(matchMedia("(pointer:fine)").matches && renderer.domElement.requestPointerLock)
-    renderer.domElement.requestPointerLock();
+window.addEventListener("keydown",e=>{
+  const k=e.key.toLowerCase();
+  if(["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"].includes(k)){
+    keys[k]=true;
+    e.preventDefault();
+  }
   startAudio();
 });
-
-document.addEventListener("mousemove",e=>{
-  if(document.pointerLockElement===renderer.domElement){
-    yaw-=e.movementX*.0022;
-    pitch-=e.movementY*.0022;
-    pitch=Math.max(-1.35,Math.min(1.35,pitch));
-  }
+window.addEventListener("keyup",e=>{
+  const k=e.key.toLowerCase();
+  keys[k]=false;
 });
+
+renderer.domElement.addEventListener("click",()=>startAudio());
+
+
 
 const look=document.getElementById("look");
+
+// ПК и телефон: зажать/коснуться экрана и двигать.
+// На ПК используется ЛКМ без Pointer Lock — курсор остаётся свободным.
+function isDesktop(){ return matchMedia("(pointer:fine)").matches; }
+
 look.addEventListener("pointerdown",e=>{
-  if(matchMedia("(pointer:coarse)").matches){
-    mouseDown=true;lastX=e.clientX;lastY=e.clientY;look.setPointerCapture(e.pointerId);startAudio();
-  }
+  if(isDesktop() && e.button!==0) return;
+  mouseDown=true;
+  lastX=e.clientX;
+  lastY=e.clientY;
+  try{ look.setPointerCapture(e.pointerId); }catch(_){}
+  startAudio();
+  e.preventDefault();
 });
+
 look.addEventListener("pointermove",e=>{
-  if(!mouseDown)return;
-  const dx=e.clientX-lastX,dy=e.clientY-lastY;
-  lastX=e.clientX;lastY=e.clientY;
-  yaw-=dx*.008;pitch-=dy*.006;
+  if(!mouseDown) return;
+  const dx=e.clientX-lastX;
+  const dy=e.clientY-lastY;
+  lastX=e.clientX;
+  lastY=e.clientY;
+  yaw-=dx*.005;
+  pitch-=dy*.004;
   pitch=Math.max(-1.35,Math.min(1.35,pitch));
+  e.preventDefault();
 });
-look.addEventListener("pointerup",()=>mouseDown=false);
-look.addEventListener("pointercancel",()=>mouseDown=false);
+
+function stopLook(e){
+  mouseDown=false;
+  try{ look.releasePointerCapture(e.pointerId); }catch(_){}
+}
+look.addEventListener("pointerup",stopLook);
+look.addEventListener("pointercancel",stopLook);
+look.addEventListener("contextmenu",e=>e.preventDefault());
+window.addEventListener("blur",()=>mouseDown=false);
 
 // joystick
 const joy=document.getElementById("joystick"),stick=document.getElementById("stick");
