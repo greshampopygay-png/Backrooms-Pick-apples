@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ЗАКУЛИСЬЕ — Optimized</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#111;font-family:Arial,sans-serif;touch-action:none}
+#game{position:fixed;inset:0}
+#hud{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:5;color:#fff;background:#0008;padding:8px 14px;border-radius:12px;font-size:16px;pointer-events:none}
+#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:20;color:white;background:#000d;font-size:30px;text-align:center;visibility:hidden;pointer-events:none}
+#err{position:fixed;inset:0;display:none;z-index:100;background:#17120d;color:#fff;padding:30px;box-sizing:border-box;font:16px Arial}
+#videoOverlay{position:fixed;inset:0;display:none;z-index:200;background:#000;align-items:center;justify-content:center}
+#videoOverlay video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
+#joystick{position:fixed;left:25px;bottom:25px;width:125px;height:125px;border:2px solid #fff8;border-radius:50%;background:#0003;z-index:10}
+#stick{position:absolute;left:35px;top:35px;width:55px;height:55px;border-radius:50%;background:#fff8}
+#look{position:fixed;right:0;top:0;width:65%;height:100%;z-index:4}
+#help{position:fixed;right:12px;bottom:12px;color:#fff9;background:#0006;padding:7px 10px;border-radius:9px;font-size:12px;z-index:6}
+#fullscreenBtn{display:none;position:fixed;right:14px;top:14px;width:58px;height:58px;padding:0;border:3px solid #ddd;border-radius:16px;background:#2b220d;color:#fff;font-size:32px;line-height:1;z-index:30;align-items:center;justify-content:center;box-shadow:0 3px 12px #0008;touch-action:manipulation}
+#fullscreenBtn:active{transform:scale(.94)}
+@media(pointer:coarse){#fullscreenBtn{display:flex}}
+@media(pointer:fine){#joystick{display:none}#look{width:100%}}
+</style>
+</head>
+<body>
+<div id="game"></div>
+<div id="hud">🍎 0 / 10</div>
+<div id="msg"></div>
+<div id="err"></div>
+  <div id="videoOverlay">
+    <video id="endVideo" playsinline preload="auto"></video>
+  </div>
+<div id="joystick"><div id="stick"></div></div>
+<div id="look"></div>
+<div id="help">ПК: WASD / ЦФЫВ / стрелки • ЛКМ + движение мыши</div>
+  <button id="fullscreenBtn" type="button" aria-label="На весь экран">⛶</button>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+"use strict";
+
+/* =========================================================
+   ЗАКУЛИСЬЕ — OPTIMIZED
+   Главное:
+   • карта разбита на chunks
+   • дальние chunks отключаются
+   • стены одного типа — InstancedMesh
+   • яблоки включаются только рядом
+   • светов мало
+   • adaptive render distance
+   • ПК: WASD + мышь / Pointer Lock
+   • телефон: joystick + свайп
+   ========================================================= */
+
+(function(){
+const errorBox=document.getElementById("err");
+function fatal(e){
+  errorBox.style.display="block";
+  errorBox.innerHTML="<h2>Ошибка запуска</h2><p>"+String(e).replace(/</g,"&lt;")+
+    "</p><p>Если игра на GitHub показывает этот экран, проверь, что интернет разрешает загрузку Three.js.</p>";
+}
+window.addEventListener("error",e=>{ if(e.error) fatal(e.error.message||e.message); });
+
+if(!window.THREE){ fatal("Three.js не загрузился."); return; }
+
+const THREE=window.THREE;
+const hud=document.getElementById("hud");
+const msg=document.getElementById("msg");
+const root=document.getElementById("game");
+
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x15110b);
+scene.fog=new THREE.Fog(0x15110b,28,95);
+
+const camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,.05,120);
+camera.position.set(2,1.65,2);
+
+const renderer=new THREE.WebGLRenderer({
+  antialias:false,
+  powerPreference:"high-performance"
+});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.35));
+renderer.setSize(innerWidth,innerHeight);
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+root.appendChild(renderer.domElement);
+
+// ---------------- SETTINGS ----------------
+const CELL=4;
+const GRID=51;                 // большая карта, но разумная для телефона
+const CHUNK_CELLS=6;
+const CHUNK_SIZE=CELL*CHUNK_CELLS;
+const LOAD_RADIUS=2;           // полные chunks вокруг игрока
+const VIEW_LIMIT=68;           // дальние chunks выключаются
+const NEED_APPLES=10;
+const APPLE_COUNT=10;
+
+let renderDistance=VIEW_LIMIT;
+let lastFPS=60, frames=0, fpsTime=performance.now();
+
+const keys={};
+let yaw=0,pitch=0;
+let mouseDown=false,lastX=0,lastY=0;
+let joystickX=0,joystickY=0;
+let gameOver=false;
+let applesGot=0;
+
+const world=new Map();
+const chunks=new Map();
+const apples=[];
+
+// ---------------- LIGHT ----------------
+scene.add(new THREE.HemisphereLight(0xffe9a6,0x221b12,1.35));
+const lampMat=new THREE.MeshBasicMaterial({color:0xffd98a});
+
+// ---------------- FLOOR / CEILING ----------------
+const floorMat=new THREE.MeshStandardMaterial({color:0xb59b57,roughness:1});
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(GRID*CELL,GRID*CELL),floorMat);
+floor.rotation.x=-Math.PI/2;
+floor.position.y=0;
+scene.add(floor);
+
+const ceilMat=new THREE.MeshStandardMaterial({color:0xc5ae72,roughness:1});
+const ceiling=new THREE.Mesh(new THREE.PlaneGeometry(GRID*CELL,GRID*CELL),ceilMat);
+ceiling.rotation.x=Math.PI/2;
+ceiling.position.y=3.2;
+scene.add(ceiling);
+
+// ---------------- MAZE ----------------
+// Deterministic randomized maze. Open cells are guaranteed reachable.
+const half=Math.floor(GRID/2);
+for(let z=-half;z<=half;z++){
+  for(let x=-half;x<=half;x++){
+    const boundary=(Math.abs(x)===half||Math.abs(z)===half);
+    // broad corridors + pseudo-random rooms
+    const r=((x*928371+z*364583) ^ (x*15731-z*9137))>>>0;
+    const open =
+      boundary ? false :
+      (x%4===0 || z%4===0 || (r%13<4));
+    world.set(x+","+z,open);
+  }
+}
+// Ensure broad main corridors and connectivity
+for(let x=-half+1;x<half;x++) world.set(x+",0",true);
+for(let z=-half+1;z<half;z++) world.set("0,"+z,true);
+for(let x=-half+1;x<half;x+=4) for(let z=-half+1;z<half;z++) world.set(x+","+z,true);
+
+// Starting area
+for(let z=-2;z<=2;z++) for(let x=-2;x<=2;x++) world.set(x+","+z,true);
+
+function isOpen(x,z){ return world.get(x+","+z)===true; }
+
+// ---------------- CHUNKS ----------------
+const wallGeo=new THREE.BoxGeometry(CELL,3.2,CELL);
+const wallMat=new THREE.MeshStandardMaterial({color:0xd8c47a,roughness:.95});
+
+function chunkKey(cx,cz){return cx+","+cz;}
+function buildChunk(cx,cz){
+  const key=chunkKey(cx,cz);
+  if(chunks.has(key)) return chunks.get(key);
+
+  const cells=[];
+  const startX=cx*CHUNK_CELLS-CHUNK_CELLS/2;
+  const startZ=cz*CHUNK_CELLS-CHUNK_CELLS/2;
+
+  for(let z=0;z<CHUNK_CELLS;z++){
+    for(let x=0;x<CHUNK_CELLS;x++){
+      const gx=Math.floor(startX+x);
+      const gz=Math.floor(startZ+z);
+      if(gx>=-half&&gx<=half&&gz>=-half&&gz<=half&&!isOpen(gx,gz))
+        cells.push([gx,gz]);
+    }
+  }
+
+  const group=new THREE.Group();
+  group.userData.cx=cx; group.userData.cz=cz;
+
+  if(cells.length){
+    const mesh=new THREE.InstancedMesh(wallGeo,wallMat,cells.length);
+    const dummy=new THREE.Object3D();
+    cells.forEach((p,i)=>{
+      dummy.position.set(p[0]*CELL+CELL/2,1.6,p[1]*CELL+CELL/2);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i,dummy.matrix);
+    });
+    mesh.instanceMatrix.needsUpdate=true;
+    mesh.frustumCulled=true;
+    group.add(mesh);
+  }
+
+  // only one tiny lamp per some chunks
+  if(((cx*17+cz*31)%5+5)%5===0){
+    const bulb=new THREE.Mesh(new THREE.SphereGeometry(.09,6,4),lampMat);
+    bulb.position.set(cx*CHUNK_SIZE,2.95,cz*CHUNK_SIZE);
+    group.add(bulb);
+    const light=new THREE.PointLight(0xffd58a,1.2,13,2);
+    light.position.copy(bulb.position);
+    group.add(light);
+  }
+
+  group.visible=false;
+  scene.add(group);
+  chunks.set(key,group);
+  return group;
+}
+
+for(let cz=-Math.ceil(GRID/CHUNK_CELLS);cz<=Math.ceil(GRID/CHUNK_CELLS);cz++)
+ for(let cx=-Math.ceil(GRID/CHUNK_CELLS);cx<=Math.ceil(GRID/CHUNK_CELLS);cx++)
+   buildChunk(cx,cz);
+
+function updateChunks(){
+  const pcx=Math.floor(camera.position.x/CHUNK_SIZE);
+  const pcz=Math.floor(camera.position.z/CHUNK_SIZE);
+  for(const ch of chunks.values()){
+    const dx=ch.userData.cx-pcx, dz=ch.userData.cz-pcz;
+    const d=Math.sqrt(dx*dx+dz*dz)*CHUNK_SIZE;
+    ch.visible=d<renderDistance;
+  }
+}
+
+// ---------------- APPLES ----------------
+const appleGeo=new THREE.SphereGeometry(.35,8,6);
+const appleMat=new THREE.MeshStandardMaterial({color:0xd71919,roughness:.65});
+const stemMat=new THREE.MeshStandardMaterial({color:0x4a2d10});
+
+function farEnough(x,z){
+  for(const a of apples){
+    if(Math.hypot(a.x-x,a.z-z)<10) return false;
+  }
+  return true;
+}
+
+let tries=0;
+while(apples.length<APPLE_COUNT && tries++<10000){
+  const x=Math.floor((Math.random()* (GRID-5))-(GRID-5)/2);
+  const z=Math.floor((Math.random()* (GRID-5))-(GRID-5)/2);
+  if(!isOpen(x,z) || Math.hypot(x,z)<5 || !farEnough(x,z)) continue;
+
+  const g=new THREE.Group();
+  const body=new THREE.Mesh(appleGeo,appleMat);
+  g.add(body);
+  const stem=new THREE.Mesh(new THREE.CylinderGeometry(.035,.035,.2,5),stemMat);
+  stem.position.y=.4; g.add(stem);
+  g.position.set(x*CELL+CELL/2,.48,z*CELL+CELL/2);
+  g.visible=false;
+  scene.add(g);
+  apples.push({x:x*CELL+CELL/2,z:z*CELL+CELL/2,mesh:g,got:false});
+}
+
+function updateApples(){
+  const px=camera.position.x,pz=camera.position.z;
+  for(const a of apples){
+    if(a.got){a.mesh.visible=false;continue;}
+    const d=Math.hypot(a.x-px,a.z-pz);
+    a.mesh.visible=d<renderDistance;
+    if(d<1.45){
+      a.got=true;a.mesh.visible=false;applesGot++;
+      hud.textContent="🍎 "+applesGot+" / "+NEED_APPLES;
+      if(applesGot>=NEED_APPLES) win();
+    }
+  }
+}
+
+// ---------------- COLLISION ----------------
+function cellBlocked(gx,gz){
+  return !isOpen(gx,gz);
+}
+
+function blocked(px,pz){
+  const gx=Math.floor(px/CELL);
+  const gz=Math.floor(pz/CELL);
+  return cellBlocked(gx,gz);
+}
+
+function canStand(px,pz){
+  // Сначала проверяем границы карты.
+  const min=-half*CELL+.35;
+  const max= half*CELL-.35;
+  if(px<min || px>max || pz<min || pz>max) return false;
+
+  // Мягкое столкновение: центр + четыре точки.
+  const r=.20;
+  return !blocked(px,pz) &&
+         !blocked(px-r,pz) &&
+         !blocked(px+r,pz) &&
+         !blocked(px,pz-r) &&
+         !blocked(px,pz+r);
+}
+
+function movePlayer(dx,dz){
+  // Очень надёжное движение: маленькие шаги не дают игроку
+  // проскочить сквозь стену даже при резком FPS.
+  const distance=Math.hypot(dx,dz);
+  const steps=Math.max(1,Math.ceil(distance/.12));
+  const sx=dx/steps, sz=dz/steps;
+
+  for(let i=0;i<steps;i++){
+    const nx=camera.position.x+sx;
+    if(canStand(nx,camera.position.z)){
+      camera.position.x=nx;
+    }
+
+    const nz=camera.position.z+sz;
+    if(canStand(camera.position.x,nz)){
+      camera.position.z=nz;
+    }
+  }
+
+  const min=-half*CELL+.35;
+  const max= half*CELL-.35;
+  camera.position.x=Math.max(min,Math.min(max,camera.position.x));
+  camera.position.z=Math.max(min,Math.min(max,camera.position.z));
+}
+
+// ---------------- MONSTER ----------------
+// Lightweight billboard monster; update only when relatively near.
+const monster=new THREE.Sprite(new THREE.SpriteMaterial({color:0xffffff}));
+monster.scale.set(2.5,2.5,1);
+monster.position.set(12,1.35,12);
+monster.visible=false;
+scene.add(monster);
+
+const monsterTexture=new THREE.TextureLoader();
+monsterTexture.load(
+  "InShot_20260725_113653092.png",
+  tex=>{tex.colorSpace=THREE.SRGBColorSpace;monster.material.map=tex;monster.material.needsUpdate=true;},
+  undefined,
+  ()=>{ monster.material.color.set(0x111111); }
+);
+
+let monsterActive=false;
+let monsterChasing=false;
+let monsterTimer=0;
+let nextScare=30+Math.random()*35;
+let scareTime=0;
+const scareDuration=.82;
+let calmTime=0;
+let playerMotion=0;
+let cameraMotion=0;
+let lastPlayerX=camera.position.x;
+let lastPlayerZ=camera.position.z;
+let lastYawForBehavior=yaw;
+let lastPitchForBehavior=pitch;
+
+const jumpscareSound=new Audio("sharp-skimmer.mp3");
+jumpscareSound.volume=.95;
+jumpscareSound.preload="auto";
+
+function scheduleNextScare(){
+  nextScare=32+Math.random()*48;
+}
+
+function playerLooksCalm(){
+  return playerMotion<.16 && cameraMotion<.018 && calmTime>2.8;
+}
+
+function startJumpscare(){
+  if(gameOver || scareTime>0 || monsterChasing) return;
+
+  scareTime=scareDuration;
+
+  const forwardX=-Math.sin(yaw);
+  const forwardZ=-Math.cos(yaw);
+  const sideX=Math.cos(yaw);
+  const sideZ=-Math.sin(yaw);
+  const side=(Math.random()-.5)*1.8;
+  const distance=.95+Math.random()*.25;
+
+  monster.position.set(
+    camera.position.x+forwardX*distance+sideX*side,
+    camera.position.y+.05+(Math.random()-.5)*.12,
+    camera.position.z+forwardZ*distance+sideZ*side
+  );
+
+  monster.visible=true;
+  monster.material.opacity=1;
+  monster.scale.set(4.6,4.6,1);
+  monster.material.rotation=(Math.random()-.5)*.08;
+
+  jumpscareSound.currentTime=0;
+  jumpscareSound.play().catch(()=>{});
+}
+
+function beginMonsterAttack(){
+  if(gameOver) return;
+
+  monsterChasing=true;
+  monsterActive=true;
+  monster.visible=true;
+  monster.scale.set(2.7,2.7,1);
+
+  const forwardX=-Math.sin(yaw);
+  const forwardZ=-Math.cos(yaw);
+  monster.position.set(
+    camera.position.x+forwardX*8,
+    1.35,
+    camera.position.z+forwardZ*8
+  );
+
+  scheduleNextScare();
+}
+
+function activateMonster(){
+  if(monsterActive || gameOver) return;
+  beginMonsterAttack();
+}
+
+function updateMonster(dt){
+  const dxp=camera.position.x-lastPlayerX;
+  const dzp=camera.position.z-lastPlayerZ;
+  playerMotion=Math.min(1,Math.hypot(dxp,dzp)/Math.max(dt,.001)/5);
+
+  const dyaw=Math.abs(yaw-lastYawForBehavior);
+  const dpitch=Math.abs(pitch-lastPitchForBehavior);
+  cameraMotion=Math.min(1,(dyaw+dpitch)/Math.max(dt,.001));
+
+  lastPlayerX=camera.position.x;
+  lastPlayerZ=camera.position.z;
+  lastYawForBehavior=yaw;
+  lastPitchForBehavior=pitch;
+
+  if(playerLooksCalm()) calmTime+=dt;
+  else calmTime=Math.max(0,calmTime-dt*.75);
+
+  if(gameOver) return;
+
+  // Редкий случайный момент. Когда игрок спокоен, шанс появления выше.
+  if(!monsterChasing && scareTime<=0){
+    monsterTimer+=dt;
+
+    if(monsterTimer>=nextScare){
+      if(playerLooksCalm() || Math.random()<.22){
+        startJumpscare();
+      }else{
+        monsterTimer=nextScare*.72;
+        scheduleNextScare();
+      }
+    }
+  }
+
+  // Монстр буквально держится перед камерой во время скримера.
+  if(scareTime>0){
+    scareTime-=dt;
+
+    const forwardX=-Math.sin(yaw);
+    const forwardZ=-Math.cos(yaw);
+    const sideX=Math.cos(yaw);
+    const sideZ=-Math.sin(yaw);
+    const t=Math.max(0,scareTime/scareDuration);
+    const shake=Math.sin((1-t)*65)*.035;
+
+    monster.position.set(
+      camera.position.x+forwardX*(.82+.18*t)+sideX*shake,
+      camera.position.y+.02,
+      camera.position.z+forwardZ*(.82+.18*t)+sideZ*shake
+    );
+    monster.visible=true;
+
+    if(scareTime<=0) beginMonsterAttack();
+    return;
+  }
+
+  if(!monsterChasing) return;
+
+  const dx=camera.position.x-monster.position.x;
+  const dz=camera.position.z-monster.position.z;
+  const d=Math.hypot(dx,dz);
+
+  if(d>80){
+    monster.visible=false;
+    return;
+  }
+
+  monster.visible=true;
+
+  if(d<1.25){
+    lose();
+    return;
+  }
+
+  const speed=5.0*dt;
+  const ax=dx/d*speed, az=dz/d*speed;
+  const oldX=monster.position.x,oldZ=monster.position.z;
+
+  if(!blocked(oldX+ax,oldZ)) monster.position.x+=ax;
+  if(!blocked(monster.position.x,oldZ+az)) monster.position.z+=az;
+}
+
+// ---------------- INPUT ----------------
+const movementKeys=new Set([
+  "w","a","s","d","ц","ф","ы","в",
+  "arrowup","arrowdown","arrowleft","arrowright"
+]);
+
+const heldKeys=Object.create(null);
+
+function setKeyState(e,down){
+  const k=(e.key||"").toLowerCase();
+  const code=e.code||"";
+
+  // Используем physical key codes: работают независимо от раскладки.
+  if(code==="KeyW" || k==="w" || k==="ц") heldKeys.forward=down;
+  if(code==="KeyS" || k==="s" || k==="ы") heldKeys.back=down;
+  if(code==="KeyA" || k==="a" || k==="ф") heldKeys.left=down;
+  if(code==="KeyD" || k==="d" || k==="в") heldKeys.right=down;
+
+  if(code==="ArrowUp" || k==="arrowup") heldKeys.forward=down;
+  if(code==="ArrowDown" || k==="arrowdown") heldKeys.back=down;
+  if(code==="ArrowLeft" || k==="arrowleft") heldKeys.left=down;
+  if(code==="ArrowRight" || k==="arrowright") heldKeys.right=down;
+
+  if(code.startsWith("Key") || code.startsWith("Arrow")){
+    e.preventDefault();
+    startAudio();
+  }
+}
+
+document.addEventListener("keydown",e=>setKeyState(e,true),{capture:true,passive:false});
+document.addEventListener("keyup",e=>setKeyState(e,false),{capture:true,passive:false});
+
+window.addEventListener("blur",()=>{
+  heldKeys.forward=heldKeys.back=heldKeys.left=heldKeys.right=false;
+});
+
+renderer.domElement.addEventListener("click",()=>startAudio());
+
+
+
+const look=document.getElementById("look");
+
+// ПК и телефон: зажать/коснуться экрана и двигать.
+// На ПК используется ЛКМ без Pointer Lock — курсор остаётся свободным.
+function isDesktop(){ return matchMedia("(pointer:fine)").matches; }
+
+look.addEventListener("pointerdown",e=>{
+  if(isDesktop() && e.button!==0) return;
+  mouseDown=true;
+  lastX=e.clientX;
+  lastY=e.clientY;
+  try{ look.setPointerCapture(e.pointerId); }catch(_){}
+  startAudio();
+  e.preventDefault();
+});
+
+look.addEventListener("pointermove",e=>{
+  if(!mouseDown) return;
+  const dx=e.clientX-lastX;
+  const dy=e.clientY-lastY;
+  lastX=e.clientX;
+  lastY=e.clientY;
+  yaw-=dx*.005;
+  pitch-=dy*.004;
+  pitch=Math.max(-1.35,Math.min(1.35,pitch));
+  e.preventDefault();
+});
+
+function stopLook(e){
+  mouseDown=false;
+  try{ look.releasePointerCapture(e.pointerId); }catch(_){}
+}
+look.addEventListener("pointerup",stopLook);
+look.addEventListener("pointercancel",stopLook);
+look.addEventListener("contextmenu",e=>e.preventDefault());
+
+// joystick
+const joy=document.getElementById("joystick"),stick=document.getElementById("stick");
+let joyPointer=null;
+joy.addEventListener("pointerdown",e=>{
+  joyPointer=e.pointerId;joy.setPointerCapture(e.pointerId);startAudio();setJoy(e);
+});
+joy.addEventListener("pointermove",e=>{if(e.pointerId===joyPointer)setJoy(e);});
+joy.addEventListener("pointerup",resetJoy);
+joy.addEventListener("pointercancel",resetJoy);
+function setJoy(e){
+  const r=joy.getBoundingClientRect();
+  const cx=r.left+r.width/2,cy=r.top+r.height/2;
+  let dx=e.clientX-cx,dy=e.clientY-cy;
+  const max=42, len=Math.hypot(dx,dy);
+  if(len>max){dx=dx/len*max;dy=dy/len*max;}
+  stick.style.transform=`translate(${dx}px,${dy}px)`;
+  joystickX=dx/max;joystickY=dy/max;
+}
+function resetJoy(){
+  joyPointer=null;stick.style.transform="translate(0,0)";joystickX=joystickY=0;
+}
+
+
+// ---------------- FULLSCREEN ----------------
+const fullscreenBtn=document.getElementById("fullscreenBtn");
+
+function updateFullscreenIcon(){
+  const active=!!(document.fullscreenElement || document.webkitFullscreenElement);
+  fullscreenBtn.textContent="⛶";
+  fullscreenBtn.setAttribute("aria-label",active?"Выйти из полноэкранного режима":"На весь экран");
+}
+
+async function toggleFullscreen(){
+  try{
+    if(!(document.fullscreenElement || document.webkitFullscreenElement)){
+      if(document.documentElement.requestFullscreen){
+        await document.documentElement.requestFullscreen();
+      }else if(document.documentElement.webkitRequestFullscreen){
+        document.documentElement.webkitRequestFullscreen();
+      }else if(renderer.domElement.webkitRequestFullscreen){
+        renderer.domElement.webkitRequestFullscreen();
+      }
+    }else{
+      if(document.exitFullscreen) await document.exitFullscreen();
+      else if(document.webkitExitFullscreen) document.webkitExitFullscreen();
+    }
+  }catch(e){}
+  updateFullscreenIcon();
+}
+
+fullscreenBtn.addEventListener("pointerdown",e=>{
+  e.preventDefault();
+  e.stopPropagation();
+  startAudio();
+  toggleFullscreen();
+});
+document.addEventListener("fullscreenchange",updateFullscreenIcon);
+document.addEventListener("webkitfullscreenchange",updateFullscreenIcon);
+updateFullscreenIcon();
+
+// ---------------- AUDIO ----------------
+let audioStarted=false;
+const bg=new Audio("backrooms.mp3");
+bg.loop=true;bg.volume=.22;
+const scare=new Audio("sharp-skimmer.mp3");
+scare.volume=.8;
+
+function startAudio(){
+  if(audioStarted)return;
+  audioStarted=true;
+  bg.play().catch(()=>{});
+}
+
+// ---------------- END ----------------
+const videoOverlay=document.getElementById("videoOverlay");
+const endVideo=document.getElementById("endVideo");
+
+function playEndVideo(filename){
+  gameOver=true;
+  videoOverlay.style.display="flex";
+  endVideo.pause();
+  endVideo.currentTime=0;
+  endVideo.src=filename;
+  endVideo.load();
+
+  const p=endVideo.play();
+  if(p) p.catch(()=>{
+    // Если браузер заблокировал звук/автозапуск, пробуем ещё раз после
+    // первого касания экрана.
+    const retry=()=>{
+      endVideo.play().catch(()=>{});
+      document.removeEventListener("pointerdown",retry);
+    };
+    document.addEventListener("pointerdown",retry,{once:true});
+  });
+}
+
+function lose(){
+  if(gameOver)return;
+  // Видео поражения запускается с самого начала.
+  playEndVideo("915015357_1789399562152517.mp4");
+}
+
+function win(){
+  if(gameOver)return;
+  // Видео победы запускается с самого начала.
+  playEndVideo("640150836_1789400025577913.mp4");
+}
+
+// ---------------- LOOP ----------------
+let last=performance.now(),chunkTimer=0,appleTimer=0,monsterSpawnTimer=0;
+
+function update(dt){
+  if(gameOver)return;
+
+  camera.rotation.order="YXZ";
+  camera.rotation.y=yaw;
+  camera.rotation.x=pitch;
+
+  // Движение: сначала читаем клавиатуру напрямую.
+  let forward=0,side=0;
+
+  if(heldKeys.forward) forward+=1;
+  if(heldKeys.back) forward-=1;
+  if(heldKeys.left) side-=1;
+  if(heldKeys.right) side+=1;
+
+  // Телефонный джойстик имеет приоритет, когда его двигают.
+  if(Math.abs(joystickX)>.05 || Math.abs(joystickY)>.05){
+    forward=-joystickY;
+    side=joystickX;
+  }
+
+  const len=Math.hypot(forward,side);
+  if(len>1){forward/=len;side/=len;}
+
+  const speed=5.0;
+  const moveX=(-Math.sin(yaw)*forward + Math.cos(yaw)*side)*speed*dt;
+  const moveZ=(-Math.cos(yaw)*forward - Math.sin(yaw)*side)*speed*dt;
+
+  // Сначала пробуем обычное движение. Если стена — movePlayer
+  // остановит только соответствующую ось.
+  if(moveX!==0 || moveZ!==0) movePlayer(moveX,moveZ);
+
+  chunkTimer+=dt;
+  appleTimer+=dt;
+  monsterSpawnTimer+=dt;
+  if(chunkTimer>.18){chunkTimer=0;updateChunks();}
+  if(appleTimer>.12){appleTimer=0;updateApples();}
+
+  updateMonster(dt);
+}
+
+function adaptiveFPS(now){
+  frames++;
+  if(now-fpsTime>1000){
+    lastFPS=frames*1000/(now-fpsTime);
+    frames=0;fpsTime=now;
+    if(lastFPS<22) renderDistance=Math.max(40,renderDistance-8);
+    else if(lastFPS>48) renderDistance=Math.min(VIEW_LIMIT,renderDistance+4);
+  }
+}
+
+function animate(now){
+  requestAnimationFrame(animate);
+  const dt=Math.min(.05,(now-last)/1000);last=now;
+  adaptiveFPS(now);
+  update(dt);
+  renderer.render(scene,camera);
+}
+updateChunks();
+updateApples();
+requestAnimationFrame(animate);
+
+addEventListener("resize",()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+})();
+</script>
+</body>
+</html>
